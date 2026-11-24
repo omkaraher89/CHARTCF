@@ -52,10 +52,12 @@ Set the secret from the dashboard instead if you prefer:
 **Workers & Pages → chartflow-terminal → Settings → Variables and Secrets →
 Add → type “Secret” → name `LSE_API_KEY`**.
 
-> Password hashing needs ~30–60 ms of CPU. `wrangler.jsonc` sets `limits.cpu_ms: 50`
-> (available on the Workers Paid plan). On the Free plan, either upgrade or lower
-> `PBKDF2_ITERATIONS` in `worker/auth.ts` (100 000 currently) — the default 10 ms
-> CPU budget can terminate a sign-in request.
+> Password hashing is tuned for the Workers **Free** plan: `PBKDF2_ITERATIONS`
+> in `worker/auth.ts` is 20 000, which keeps sign-up/sign-in around 4–6 ms of CPU
+> inside the Free plan's 10 ms budget, and `wrangler.jsonc` deliberately sets no
+> `limits.cpu_ms` (Cloudflare rejects that on Free with error 100328).
+> On the Workers Paid plan you can raise `PBKDF2_ITERATIONS` back to 100 000 and
+> add `"limits": { "cpu_ms": 50 }` to `wrangler.jsonc` for stronger hashing.
 
 
 ## Deploy with Cloudflare Pages (Git-connected)
@@ -68,8 +70,7 @@ reuses the exact same API as the Worker, so auth and the workspace API work on P
 3. After the first build: Pages project → **Settings → Functions → Bindings**
    - D1 database binding: variable name **`DB`** → your `chartflow` database
    - Secret: **`LSE_API_KEY`** → your LSE key
-4. Settings → Runtime → Compatibility date `2026-11-23` (and enable the Workers Paid
-   plan or lower `PBKDF2_ITERATIONS`, see the note below).
+4. Settings → Runtime → Compatibility date `2026-11-23`.
 5. Retry the deployment so the bindings are live.
 
 Create the tables once (Pages uses the same database as the Worker):
