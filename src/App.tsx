@@ -1298,7 +1298,8 @@ export default function App({ initialUser }: { initialUser: AccountUser | null }
               applyIncomingTick(item.tick as SymbolInfo, item.rawTick, item.seq);
             }
           }
-        } else if (Array.isArray(data.symbols) && data.symbols.length > 0) {
+        }
+        if (Array.isArray(data.symbols) && data.symbols.length > 0) {
           setSymbols(data.symbols);
           // Also merge active visible symbol prices into live candles if price changed
           const visibleSet = new Set(visibleSymbolsSigRef.current.split(',').filter(Boolean));
@@ -1330,15 +1331,16 @@ export default function App({ initialUser }: { initialUser: AccountUser | null }
       }
     };
 
-    // Quick initial fallback check after 2.5s if WS hasn't delivered a tick yet, then every 3.5s
-    const initialTimer = setTimeout(pollLive, 2_500);
-    const interval = setInterval(pollLive, 3_500);
+    // Poll fast: the worker serves 1s vault candles, so a 1s client interval is the tightest
+    // cadence REST polling can reach without multiplying upstream LSE calls.
+    const initialTimer = setTimeout(pollLive, 150);
+    const interval = setInterval(pollLive, 1_000);
     return () => {
       cancelled = true;
       clearTimeout(initialTimer);
       clearInterval(interval);
     };
-  }, [liveStreamEnabled, wsConnected, applyIncomingTick]);
+  }, [liveStreamEnabled, wsConnected, applyIncomingTick, visibleSymbolsSig]);
 
   // Bar Replay auto-advance timer
   useEffect(() => {

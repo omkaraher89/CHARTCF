@@ -361,20 +361,27 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
   }
 
   if (path === '/api/market/live') {
-    await ensureHydrated(client);
+    // Never block the live feed on first-run watchlist hydration: serve the cached symbols now.
+    void ensureHydrated(client);
     const symbolsParam = (url.searchParams.get('symbols') || '').trim();
     const priority = symbolsParam
       ? symbolsParam.split(',').map((s) => s.trim()).filter(Boolean).slice(0, 8)
       : ['NASDAQ100', 'BTCUSDT'];
+    let polled: Awaited<ReturnType<LseClient['pollLiveQuotesFallback']>> = [];
     try {
-      await client.pollLiveQuotesFallback(priority);
+      polled = await client.pollLiveQuotesFallback(priority);
     } catch {
       // Serve the last known snapshot even if the upstream poll fails
     }
+    const baseSeq = Date.now();
     return json({
       symbols: client.getAllSymbols(),
-      ticks: [],
-      seq: 0,
+      ticks: polled.map((item, idx) => ({
+        seq: baseSeq + idx,
+        tick: item.sym,
+        rawTick: item.rawTick,
+      })),
+      seq: baseSeq + polled.length,
       liveStreamEnabled: true,
       wsStatus: client.getWsStatus(),
       serverTime: Date.now(),

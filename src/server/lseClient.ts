@@ -62,6 +62,9 @@ interface CacheEntry<T> {
   expiresAt: number;
 }
 
+// Minimum gap between two upstream live-quote polls for the same symbol.
+const LIVE_POLL_MIN_INTERVAL_MS = 1_000;
+
 export interface LseTickPayload {
   symbol: string;
   price: number;
@@ -103,8 +106,9 @@ export class LseClient {
   private lastWsError: string | null = null;
   private intentionalStop = false;
   private wsActive = false;
-  private lastFallbackPollAt = 0;
-  private fallbackCursor = 0;
+  // Per-symbol timestamp of the last live-quote poll, so several browser clients polling
+  // the same symbol share one upstream REST call instead of multiplying it.
+  private livePollAtBySymbol = new Map<string, number>();
   private onTickCallback: ((sym: SymbolInfo, rawTick: LseTickPayload) => void) | null = null;
   private isPaused = false;
 
@@ -1807,52 +1811,62 @@ export class LseClient {
   }
 
   /**
-   * Real LSE Vault 1m live quote poller used automatically when upstream LSE WebSockets
-   * are temporarily unavailable or contested (e.g. free plan 1-connection slot shared across
-   * Preview and Published instances).
+   * Real LSE Vault live quote poller used automatically when upstream LSE WebSockets are
+   * unavailable (Cloudflare Workers cannot hold the persistent sockets). Reads 1-second
+   * candles so prices trail upstream by roughly one second instead of one minute.
    */
   public async pollLiveQuotesFallback(
     prioritySymbols: string[] = []
   ): Promise<Array<{ sym: SymbolInfo; rawTick: LseTickPayload }>> {
     if (!this.apiKey || this.isPaused) return [];
     const now = Date.now();
-    if (now - this.lastFallbackPollAt < 3_500) return [];
-    this.lastFallbackPollAt = now;
 
-    const ordered: SymbolInfo[] = [];
+    const requested: SymbolInfo[] = [];
     const seen = new Set<string>();
     for (const key of prioritySymbols) {
       const s = this.getSymbol(key);
       if (s && !seen.has(s.symbol)) {
         seen.add(s.symbol);
-        ordered.push(s);
+        requested.push(s);
       }
     }
-    const defaults = ['NASDAQ100', 'BTCUSDT', 'SP500', 'GOLD', 'EUR_USD', 'NVDA'];
-    for (const key of defaults) {
-      const s = this.getSymbol(key);
-      if (s && !seen.has(s.symbol)) {
-        seen.add(s.symbol);
-        ordered.push(s);
+    if (requested.length === 0) {
+      for (const key of ['NASDAQ100', 'BTCUSDT']) {
+        const s = this.getSymbol(key);
+        if (s && !seen.has(s.symbol)) {
+          seen.add(s.symbol);
+          requested.push(s);
+        }
       }
     }
-    if (ordered.length === 0) return [];
+    if (requested.length === 0) return [];
 
-    // Poll at most 2 symbols per cycle (1 active priority + 1 rotating) to stay well under 60 calls/min
-    const batch: SymbolInfo[] = [ordered[0]];
-    if (ordered.length > 1) {
-      const rotIdx = 1 + (this.fallbackCursor % (ordered.length - 1));
-      this.fallbackCursor++;
-      batch.push(ordered[rotIdx]);
-    }
+    // Only the symbols the browser is actually showing are refreshed, least-recently-polled first,
+    // at most one per call. That keeps upstream REST usage at ~60 calls/min in total, no matter
+    // how many browser tabs are polling, while still refreshing every visible symbol in turn.
+    const batch: SymbolInfo[] = requested
+      .map((s) => ({ s, at: this.livePollAtBySymbol.get(s.symbol) ?? 0 }))
+      .sort((a, b) => a.at - b.at)
+      .filter((x) => now - x.at >= LIVE_POLL_MIN_INTERVAL_MS)
+      .slice(0, 1)
+      .map((x) => x.s);
+    if (batch.length === 0) return [];
 
-    const endIso = new Date(now + 120_000).toISOString().slice(0, 19) + 'Z';
-    const startIso = new Date(now - 35 * 60_000).toISOString().slice(0, 19) + 'Z';
+    const endIso = new Date(now + 60_000).toISOString().slice(0, 19) + 'Z';
+    const startIso = new Date(now - 90_000).toISOString().slice(0, 19) + 'Z';
     const emitted: Array<{ sym: SymbolInfo; rawTick: LseTickPayload }> = [];
 
     for (const sym of batch) {
+      this.livePollAtBySymbol.set(sym.symbol, now);
       try {
-        const bars = await this.fetchVaultCandles(sym, '1m', startIso, endIso, 40, 3_000);
+        // 1-second vault candles put the served price at most ~1s behind upstream; the 1m
+        // candles used before carried up to a full minute of staleness. Fall back if 1s is absent.
+        let bars = await this.fetchVaultCandles(sym, '1s', startIso, endIso, 120, 800);
+        let barSeconds = 1;
+        if (bars.length === 0) {
+          bars = await this.fetchVaultCandles(sym, '1m', startIso, endIso, 40, 800);
+          barSeconds = 60;
+        }
         const lastBar = bars[bars.length - 1];
         if (!lastBar || !Number.isFinite(lastBar.close) || lastBar.close <= 0) continue;
 
@@ -1873,6 +1887,11 @@ export class LseClient {
         const prevBars = this.liveBars1m.get(sym.symbol) || [];
         const nextBars = mergeTickIntoCandles(prevBars, price, lastBar.time, 0, 60);
         this.liveBars1m.set(sym.symbol, nextBars.length > 1440 ? nextBars.slice(-1440) : nextBars);
+        if (barSeconds === 1) {
+          const prevSec = this.liveBars1s.get(sym.symbol) || [];
+          const nextSec = mergeTickIntoCandles(prevSec, price, lastBar.time, 0, 1);
+          this.liveBars1s.set(sym.symbol, nextSec.length > 1800 ? nextSec.slice(-1800) : nextSec);
+        }
 
         const updated: SymbolInfo = {
           ...current,
